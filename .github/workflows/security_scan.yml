@@ -4,15 +4,6 @@ permissions:
   contents: read
   security-events: write
 on:
-  push:
-    branches: [ '**' ]
-  workflow_dispatch:
-    inputs:
-      fetch_depth:
-        description: 'Number of commits to fetch (0 for all history)'
-        required: false
-        default: '1'
-        type: string
   workflow_call:
     inputs:
       fetch_depth:
