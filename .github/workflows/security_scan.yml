@@ -22,7 +22,7 @@ on:
         type: string
 
 env:
-  WORKFLOW_VERSION: "1.7.0"
+  WORKFLOW_VERSION: "1.10.0"
   # Pin Docker images by digest for reproducibility (avoid floating monthly tags).
   # secobserve-scanners:2026_04 amd64 digest:
   SO_SCANNERS_IMAGE: 'ghcr.io/secobserve/secobserve-scanners@sha256:c142c4bac337fefebc991b5b9b43b26b371ed44672c0f5291f819faa1902f9e7'
@@ -39,18 +39,16 @@ jobs:
       FULL_SCAN: ${{ github.event_name == 'workflow_dispatch' || github.ref_name == github.event.repository.default_branch || contains(fromJSON('["main","master","dev","sec"]'), github.ref_name) }}
 
     steps:
-      # Pin actions to a specific commit SHA for immutability
       - name: Checkout code
         uses: actions/checkout@v6
         with:
           fetch-depth: ${{ inputs.fetch_depth || 1 }}
 
-      # 1. Run Gitleaks (local action pins secobserve-scanners image by digest)
-      - name: Run Gitleaks
-        uses: lbnl-science-it/security-workflows/.github/actions/gitleaks@main
+      # 1. Run TruffleHog (local action pins secobserve-scanners image by digest)
+      - name: Run TruffleHog
+        uses: lbnl-science-it/security-workflows/.github/actions/trufflehog@main
         with:
-          report_name: 'gitleaks.sarif'
-          further_parameters: '--redact=80'
+          report_name: 'trufflehog.json'
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
           so_product_name: ${{ github.event.repository.name }}
@@ -109,6 +107,54 @@ jobs:
           target: '.'
           configuration: 'p/default'
           report_name: 'semgrep.json'
+          so_upload: 'false'
+          so_api_base_url: ${{ vars.SO_API_BASE_URL }}
+          so_api_token: ${{ secrets.SO_API_TOKEN }}
+          so_product_name: ${{ github.event.repository.name }}
+          so_branch_name: ${{ github.ref_name }}
+          so_origin_service: git-scan
+          so_origin_docker_image_name_tag: ${{ github.sha }}
+
+      - name: Filter Semgrep Report
+        if: env.FULL_SCAN == 'true' && always()
+        run: |
+          if [ -f semgrep.json ]; then
+            python3 -c "
+          import json, os, sys
+          try:
+              with open('semgrep.json', 'r') as f:
+                  data = json.load(f)
+              filtered = False
+              if isinstance(data, dict):
+                  if 'runs' in data:
+                      for run in data.get('runs', []):
+                          if 'results' in run:
+                              orig = len(run['results'])
+                              run['results'] = [r for r in run['results'] if not any(k in r.get('ruleId', '').lower() for k in ['secret', 'private-key', 'private_key', 'api-key', 'api_key'])]
+                              if len(run['results']) < orig:
+                                  filtered = True
+                  elif 'results' in data:
+                      orig = len(data['results'])
+                      data['results'] = [r for r in data['results'] if not any(k in r.get('check_id', '').lower() for k in ['secret', 'private-key', 'private_key', 'api-key', 'api_key'])]
+                      if len(data['results']) < orig:
+                          filtered = True
+              if filtered:
+                  with open('semgrep.json', 'w') as f:
+                      json.dump(data, f, indent=2)
+                  print('Filtered secrets from semgrep.json')
+              else:
+                  print('No secrets found/filtered in semgrep.json')
+          except Exception as e:
+              print(f'Error filtering semgrep.json: {e}')
+            "
+          fi
+
+      - name: Upload Semgrep to SecObserve
+        if: env.FULL_SCAN == 'true' && always()
+        uses: lbnl-science-it/security-workflows/.github/actions/importer@main
+        with:
+          so_file_name: 'semgrep.json'
+          so_parser_name: 'SARIF'
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
           so_product_name: ${{ github.event.repository.name }}
@@ -132,7 +178,7 @@ jobs:
           name: security-reports-${{ github.sha }}
           if-no-files-found: ignore
           path: |
-            gitleaks.sarif
+            trufflehog.json
             trivy.json
             osv_scanner.sarif
             semgrep.json
