@@ -28,6 +28,8 @@ env:
   SO_SCANNERS_IMAGE: 'ghcr.io/secobserve/secobserve-scanners@sha256:c142c4bac337fefebc991b5b9b43b26b371ed44672c0f5291f819faa1902f9e7'
   # osv-scanner v2.3.8 amd64 digest:
   OSV_SCANNER_IMAGE: 'ghcr.io/google/osv-scanner@sha256:904f48030672996473eda96b9193a090c0b2096b0d45b63e51b19b34533b7171'
+  # trufflehog v3.95.5 multi-arch digest (official image; the secobserve-scanners image has no trufflehog binary):
+  TRUFFLEHOG_IMAGE: 'ghcr.io/trufflesecurity/trufflehog@sha256:56c25710275c4b8d74c4f1346a5e7c606fa7ff4afe996f680b288d0fae3fcd9c'
 
 jobs:
   security_scan:
@@ -44,11 +46,101 @@ jobs:
         with:
           fetch-depth: ${{ inputs.fetch_depth || 1 }}
 
-      # 1. Run TruffleHog (local action pins secobserve-scanners image by digest)
+      # 1. Run TruffleHog for verified secrets (runs on every branch).
+      #    SecObserve has no TruffleHog parser and the secobserve-scanners image
+      #    has no trufflehog binary, so we run the official image, convert its
+      #    JSON to SARIF, and import via the SARIF parser. The converter is
+      #    inlined (not a checked-out script) because this reusable workflow runs
+      #    against the *caller's* checkout, which does not contain our scripts.
+      #    Verified findings -> SARIF level "error" -> SecObserve HIGH severity.
       - name: Run TruffleHog
-        uses: lbnl-science-it/security-workflows/.github/actions/trufflehog@main
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/repo ${{ env.TRUFFLEHOG_IMAGE }} \
+            git file:///repo --results=verified --json > trufflehog.json || true
+
+      - name: Convert TruffleHog Report to SARIF
+        run: |
+          python3 - trufflehog.json trufflehog.sarif <<'PY'
+          import json, sys
+
+          SCHEMA = ("https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/"
+                    "sarif-2.1/schema/sarif-schema-2.1.0.json")
+          src, dst = sys.argv[1], sys.argv[2]
+
+          def findings(path):
+              try:
+                  lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+              except FileNotFoundError:
+                  return
+              for line in lines:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      obj = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  for item in (obj if isinstance(obj, list) else [obj]):
+                      if isinstance(item, dict) and "SourceMetadata" in item:
+                          yield item
+
+          def source_data(finding):
+              data = (finding.get("SourceMetadata") or {}).get("Data") or {}
+              if isinstance(data, dict):
+                  for kind, value in data.items():
+                      if isinstance(value, dict) and value:
+                          return value, kind
+              return {}, ""
+
+          results, rules = [], {}
+          for finding in findings(src):
+              detector = finding.get("DetectorName") or "UnknownDetector"
+              verified = bool(finding.get("Verified"))
+              redacted = finding.get("Redacted") or ""
+              source, kind = source_data(finding)
+              uri = source.get("file") or ""
+              commit = source.get("commit") or ""
+              try:
+                  line_no = int(source.get("line"))
+              except (TypeError, ValueError):
+                  line_no = 0
+              line_no = line_no if line_no >= 1 else 1
+              text = "{} secret detected and {} by TruffleHog.".format(
+                  detector, "verified" if verified else "unverified")
+              if redacted:
+                  text += " Redacted match: {}".format(redacted)
+              if commit:
+                  text += " Commit: {}".format(commit)
+              result = {"ruleId": detector,
+                        "level": "error" if verified else "warning",
+                        "message": {"text": text}}
+              if uri:
+                  result["locations"] = [{"physicalLocation": {
+                      "artifactLocation": {"uri": uri},
+                      "region": {"startLine": line_no}}}]
+              result["partialFingerprints"] = {"truffleHogFinding/v1":
+                  "/".join([detector, kind, uri, commit, redacted, str(line_no)])}
+              results.append(result)
+              rules.setdefault(detector, {"id": detector, "name": detector,
+                  "shortDescription": {"text": detector + " secret detected by TruffleHog"},
+                  "helpUri": "https://github.com/trufflesecurity/trufflehog"})
+
+          sarif = {"$schema": SCHEMA, "version": "2.1.0", "runs": [{
+              "tool": {"driver": {"name": "TruffleHog",
+                  "informationUri": "https://github.com/trufflesecurity/trufflehog",
+                  "version": "3.95.5", "rules": list(rules.values())}},
+              "results": results}]}
+          with open(dst, "w", encoding="utf-8") as handle:
+              json.dump(sarif, handle, indent=2)
+              handle.write("\n")
+          print("Wrote {} TruffleHog finding(s) to {}".format(len(results), dst))
+          PY
+
+      - name: Upload TruffleHog to SecObserve
+        uses: lbnl-science-it/security-workflows/.github/actions/importer@main
         with:
-          report_name: 'trufflehog.json'
+          so_file_name: 'trufflehog.sarif'
+          so_parser_name: 'SARIF'
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
           so_product_name: ${{ github.event.repository.name }}
@@ -179,6 +271,7 @@ jobs:
           if-no-files-found: ignore
           path: |
             trufflehog.json
+            trufflehog.sarif
             trivy.json
             osv_scanner.sarif
             semgrep.json
