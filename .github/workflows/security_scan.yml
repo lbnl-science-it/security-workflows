@@ -22,7 +22,7 @@ on:
         required: true
 
 env:
-  WORKFLOW_VERSION: "1.12.0"
+  WORKFLOW_VERSION: "1.13.0"
   # Pin Docker images by digest for reproducibility (avoid floating monthly tags).
   # secobserve-scanners:2026_04 amd64 digest:
   SO_SCANNERS_IMAGE: 'ghcr.io/secobserve/secobserve-scanners@sha256:c142c4bac337fefebc991b5b9b43b26b371ed44672c0f5291f819faa1902f9e7'
@@ -367,51 +367,82 @@ jobs:
           so_origin_service: git-scan
           so_origin_docker_image_name_tag: ${{ github.sha }}
 
+      # Semgrep's p/default pack includes the `generic.secrets.*` rules, whose
+      # whole job is matching credential *values* — and SecObserve stores the
+      # matched snippet as evidence, so an uploaded hit puts the raw value in the
+      # findings database. TruffleHog is this pipeline's secret scanner and it
+      # verifies before reporting; Semgrep's shape-matches are dropped instead.
+      #
+      # Two defects this step used to have, both worth not reintroducing:
+      #   - It rewrote semgrep.json in place. The Semgrep action is a *docker*
+      #     action, so its report is owned by root while `run:` steps execute as
+      #     the runner user: every scan died on
+      #     `PermissionError: [Errno 13] Permission denied: 'semgrep.json'`,
+      #     which fails closed but also means the filter never actually ran. The
+      #     filtered report is now a new file the runner owns.
+      #   - It matched the substrings `secret`, `api-key`, `private-key` … against
+      #     the rule id, which is both too wide and too narrow: it would have
+      #     dropped real SAST findings such as
+      #     `yaml.github-actions.security.secrets-inherit` while keeping
+      #     `detected-aws-access-key-id-value`, which carries an actual key. The
+      #     rule id's *namespace* is the thing that identifies the secrets pack.
       - name: Filter Semgrep Report
         id: filter_semgrep
         if: env.FULL_SCAN == 'true' && always()
         run: |
-          if [ -f semgrep.json ]; then
-            python3 -c "
-          import json, os, sys
-          try:
-              with open('semgrep.json', 'r') as f:
-                  data = json.load(f)
-              filtered = False
-              if isinstance(data, dict):
-                  if 'runs' in data:
-                      for run in data.get('runs', []):
-                          if 'results' in run:
-                              orig = len(run['results'])
-                              run['results'] = [r for r in run['results'] if not any(k in r.get('ruleId', '').lower() for k in ['secret', 'private-key', 'private_key', 'api-key', 'api_key'])]
-                              if len(run['results']) < orig:
-                                  filtered = True
-                  elif 'results' in data:
-                      orig = len(data['results'])
-                      data['results'] = [r for r in data['results'] if not any(k in r.get('check_id', '').lower() for k in ['secret', 'private-key', 'private_key', 'api-key', 'api_key'])]
-                      if len(data['results']) < orig:
-                          filtered = True
-              if filtered:
-                  with open('semgrep.json', 'w') as f:
-                      json.dump(data, f, indent=2)
-                  print('Filtered secrets from semgrep.json')
-              else:
-                  print('No secrets found/filtered in semgrep.json')
-          except Exception as e:
-              try:
-                  os.remove('semgrep.json')
-              except FileNotFoundError:
-                  pass
-              print(f'Error filtering semgrep.json: {e}', file=sys.stderr)
-              raise
-            "
+          if [ ! -f semgrep.json ]; then
+            echo "No semgrep.json to filter."
+            exit 0
           fi
+          rm -f semgrep_filtered.json
+          python3 - semgrep.json semgrep_filtered.json <<'FILTER'
+          import json, sys
+
+          # Semgrep registry ids are `<namespace>.<path>.<rule>.<rule>`; every
+          # rule whose purpose is matching a credential value lives here.
+          SECRETS_NAMESPACE = "generic.secrets."
+
+          source_path, target_path = sys.argv[1], sys.argv[2]
+          with open(source_path, encoding="utf-8") as handle:
+              report = json.load(handle)
+
+          def keep(rule_id):
+              return not str(rule_id or "").startswith(SECRETS_NAMESPACE)
+
+          removed = 0
+          if isinstance(report, dict) and isinstance(report.get("runs"), list):
+              # SARIF, which is what this pipeline uploads.
+              for run in report["runs"]:
+                  results = run.get("results")
+                  if not isinstance(results, list):
+                      continue
+                  kept = [r for r in results if keep(r.get("ruleId"))]
+                  removed += len(results) - len(kept)
+                  run["results"] = kept
+          elif isinstance(report, dict) and isinstance(report.get("results"), list):
+              # Semgrep's native JSON, in case the scanner image stops emitting SARIF.
+              results = report["results"]
+              kept = [r for r in results if keep(r.get("check_id"))]
+              removed += len(results) - len(kept)
+              report["results"] = kept
+          else:
+              raise SystemExit(
+                  "semgrep.json has neither SARIF runs nor native results; refusing to "
+                  "upload a report this step cannot filter"
+              )
+
+          with open(target_path, "w", encoding="utf-8") as handle:
+              json.dump(report, handle, indent=2)
+              handle.write("\n")
+
+          print("Removed %d %s* result(s); wrote %s" % (removed, SECRETS_NAMESPACE, target_path))
+          FILTER
 
       - name: Upload Semgrep to SecObserve
-        if: env.FULL_SCAN == 'true' && always() && steps.filter_semgrep.outcome == 'success' && hashFiles('semgrep.json') != ''
+        if: env.FULL_SCAN == 'true' && always() && steps.filter_semgrep.outcome == 'success' && hashFiles('semgrep_filtered.json') != ''
         uses: lbnl-science-it/security-workflows/.github/actions/importer@3d796045e23440d4d09a5961f37497361798db07 # published main, 2026-07-31
         with:
-          so_file_name: 'semgrep.json'
+          so_file_name: 'semgrep_filtered.json'
           so_parser_name: 'SARIF'
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
@@ -433,6 +464,9 @@ jobs:
       #    trufflehog.json is deliberately NOT here: the raw NDJSON carries each
       #    verified secret in plaintext (Raw/RawV2), so it stays on the runner's
       #    disk as the converter's input only. The SARIF is the redacted form.
+      #    semgrep.json is out for the same reason — it is the unfiltered report,
+      #    whose `generic.secrets.*` hits quote the matched credential. Only the
+      #    filtered copy travels.
       - name: Upload Artifacts
         if: always() && steps.filter_semgrep.outcome != 'failure'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -443,7 +477,7 @@ jobs:
             trufflehog.sarif
             trivy.json
             osv_scanner.sarif
-            semgrep.json
+            semgrep_filtered.json
 
       # 7. Fail the job if any scanner did not run. Each failure was recorded
       #    when it happened and a scanner-execution-failure sentinel was
