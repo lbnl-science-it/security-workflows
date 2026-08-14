@@ -2,7 +2,6 @@ name: Security Scan and SecObserve Upload
 
 permissions:
   contents: read
-  security-events: write
 on:
   workflow_call:
     inputs:
@@ -11,9 +10,19 @@ on:
         required: false
         default: '1'
         type: string
+    # Declared so callers can pass this one secret by name instead of
+    # `secrets: inherit`, which hands a third-party-callable reusable workflow
+    # every secret the calling repository holds (CWE-250). This is the only
+    # secret the workflow reads; SO_API_BASE_URL is a `vars` entry, which a
+    # called workflow resolves from the caller's own repository and org without
+    # being passed.
+    secrets:
+      SO_API_TOKEN:
+        description: 'SecObserve API token used to upload observations'
+        required: true
 
 env:
-  WORKFLOW_VERSION: "1.10.1"
+  WORKFLOW_VERSION: "1.12.0"
   # Pin Docker images by digest for reproducibility (avoid floating monthly tags).
   # secobserve-scanners:2026_04 amd64 digest:
   SO_SCANNERS_IMAGE: 'ghcr.io/secobserve/secobserve-scanners@sha256:c142c4bac337fefebc991b5b9b43b26b371ed44672c0f5291f819faa1902f9e7'
@@ -33,7 +42,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: ${{ inputs.fetch_depth || 1 }}
 
@@ -44,25 +53,91 @@ jobs:
       #    inlined (not a checked-out script) because this reusable workflow runs
       #    against the *caller's* checkout, which does not contain our scripts.
       #    Verified findings -> SARIF level "error" -> SecObserve HIGH severity.
+      #    Fail closed: TruffleHog exits 0 with or without findings (we do not
+      #    pass --fail, which exits 183 on findings), so any non-zero exit --
+      #    docker daemon/pull failures (125), a non-runnable or missing command
+      #    (126/127), kills such as 137 (OOM) -- means the scan DID NOT RUN.
+      #    Record it and continue: the convert step uploads a sentinel finding
+      #    in the scan's place, the remaining scanners still run, and the final
+      #    "Enforce scanner status" step turns the job red.
       - name: Run TruffleHog
+        id: trufflehog_scan
         run: |
-          docker run --rm -v ${{ github.workspace }}:/repo ${{ env.TRUFFLEHOG_IMAGE }} \
-            git file:///repo --results=verified --json > trufflehog.json || true
+          STATUS=0
+          docker run --rm -v "$GITHUB_WORKSPACE":/repo "$TRUFFLEHOG_IMAGE" \
+            git file:///repo --results=verified --json > trufflehog.json || STATUS=$?
+          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "scanner_failed=true" >> "$GITHUB_OUTPUT"
+            echo "::error::TruffleHog did not run: docker exit code $STATUS"
+          fi
 
       - name: Convert TruffleHog Report to SARIF
+        env:
+          TRUFFLEHOG_EXIT_CODE: ${{ steps.trufflehog_scan.outputs.exit_code }}
         run: |
-          python3 - trufflehog.json trufflehog.sarif <<'PY'
-          import json, sys
+          # On the failure path, write the scanner-execution-failure sentinel
+          # (one "scanner-execution-failure" result at level "error" under the
+          # same TruffleHog tool driver) instead of converting crash output into
+          # a clean zero-finding SARIF. Keep behaviorally consistent with
+          # .github/scripts/scanner_failure_sarif.py in the git-scan repository.
+          # Both message.text and the rule shortDescription.text carry the
+          # pinned "Scanner execution failure:" prefix so the SecObserve
+          # observation title starts with it whichever field SecObserve titles
+          # from; Insights matches the failure by that title prefix.
+          if [ "$TRUFFLEHOG_EXIT_CODE" != "0" ]; then
+            printf '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"TruffleHog","informationUri":"https://github.com/trufflesecurity/trufflehog","version":"3.95.5","rules":[{"id":"scanner-execution-failure","name":"ScannerExecutionFailure","shortDescription":{"text":"Scanner execution failure: TruffleHog did not run"},"helpUri":"https://github.com/trufflesecurity/trufflehog"}]}},"results":[{"ruleId":"scanner-execution-failure","level":"error","message":{"text":"Scanner execution failure: TruffleHog did not run: docker exit code %s. This is a scan-execution failure, not a finding in the scanned code: the scanner crashed or could not start, so this scan produced no results and cannot prove the target is clean."},"partialFingerprints":{"scannerExecutionFailure/v1":"TruffleHog"}}]}]}\n' "$TRUFFLEHOG_EXIT_CODE" > trufflehog.sarif
+            echo "Wrote scanner-execution-failure sentinel to trufflehog.sarif"
+            exit 0
+          fi
+          python3 - trufflehog.json trufflehog.sarif --tool-version 3.95.5 <<'PY'
+          # BEGIN GENERATED: .github/scripts/trufflehog_to_sarif.py
+          #!/usr/bin/env python3
+          """Convert TruffleHog JSON output into SARIF 2.1.0 for SecObserve.
 
-          SCHEMA = ("https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/"
-                    "sarif-2.1/schema/sarif-schema-2.1.0.json")
-          src, dst = sys.argv[1], sys.argv[2]
+          SecObserve has no TruffleHog parser, but it does have a SARIF parser. TruffleHog
+          cannot emit SARIF natively (only default / --json / --github-actions), so this
+          script bridges the gap: it reads TruffleHog's newline-delimited JSON (one finding
+          per line, as produced by `trufflehog ... --json`) and writes a SARIF report that
+          SecObserve's SARIF parser accepts.
 
-          def findings(path):
+          Severity mapping (SecObserve SARIF parser): SARIF `level` "error" -> HIGH,
+          "warning" -> MEDIUM. We run TruffleHog with --results=verified, so every finding
+          is a live, confirmed secret and is emitted as "error" (HIGH).
+
+          If the input is missing, empty, or contains no findings, a valid empty SARIF
+          envelope is written so SecObserve never rejects an empty file (mirrors how the
+          OSV-Scanner step handles a no-vulnerabilities run).
+          """
+
+          import argparse
+          import json
+          import sys
+
+          # Matches the $schema used by the OSV-Scanner empty envelope elsewhere in these
+          # workflows. SecObserve's check_format() only requires "sarif" in the $schema and
+          # version == "2.1.0".
+          SARIF_SCHEMA = (
+              "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/"
+              "sarif-2.1/schema/sarif-schema-2.1.0.json"
+          )
+          TOOL_NAME = "TruffleHog"
+          TOOL_URI = "https://github.com/trufflesecurity/trufflehog"
+
+
+          def _iter_findings(path):
+              """Yield TruffleHog finding dicts from an NDJSON file.
+
+              Tolerant of: a missing/empty file, blank lines, non-JSON banner lines, and
+              log/stats objects that lack SourceMetadata. A finding is any JSON object that
+              carries a "SourceMetadata" key.
+              """
               try:
-                  lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+                  with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                      lines = handle.readlines()
               except FileNotFoundError:
                   return
+
               for line in lines:
                   line = line.strip()
                   if not line:
@@ -70,65 +145,138 @@ jobs:
                   try:
                       obj = json.loads(line)
                   except json.JSONDecodeError:
+                      # TruffleHog sends logs to stderr, but stay defensive about stray
+                      # non-JSON on stdout.
                       continue
-                  for item in (obj if isinstance(obj, list) else [obj]):
-                      if isinstance(item, dict) and "SourceMetadata" in item:
-                          yield item
+                  if isinstance(obj, list):
+                      for item in obj:
+                          if isinstance(item, dict) and "SourceMetadata" in item:
+                              yield item
+                  elif isinstance(obj, dict) and "SourceMetadata" in obj:
+                      yield obj
 
-          def source_data(finding):
+
+          def _source_data(finding):
+              """Return the inner source dict (Git/Filesystem/Github/...) and its kind."""
               data = (finding.get("SourceMetadata") or {}).get("Data") or {}
-              if isinstance(data, dict):
-                  for kind, value in data.items():
-                      if isinstance(value, dict) and value:
-                          return value, kind
+              if not isinstance(data, dict):
+                  return {}, ""
+              for kind, value in data.items():
+                  if isinstance(value, dict) and value:
+                      return value, kind
               return {}, ""
 
-          results, rules = [], {}
-          for finding in findings(src):
+
+          def _start_line(source):
+              line = source.get("line")
+              try:
+                  line = int(line)
+              except (TypeError, ValueError):
+                  line = 0
+              # SARIF requires startLine >= 1.
+              return line if line >= 1 else 1
+
+
+          def _result(finding):
               detector = finding.get("DetectorName") or "UnknownDetector"
               verified = bool(finding.get("Verified"))
               redacted = finding.get("Redacted") or ""
-              source, kind = source_data(finding)
+              decoder = finding.get("DecoderName") or ""
+              source, kind = _source_data(finding)
+
               uri = source.get("file") or ""
               commit = source.get("commit") or ""
-              try:
-                  line_no = int(source.get("line"))
-              except (TypeError, ValueError):
-                  line_no = 0
-              line_no = line_no if line_no >= 1 else 1
-              text = "{} secret detected and {} by TruffleHog.".format(
-                  detector, "verified" if verified else "unverified")
-              if redacted:
-                  text += " Redacted match: {}".format(redacted)
-              if commit:
-                  text += " Commit: {}".format(commit)
-              result = {"ruleId": detector,
-                        "level": "error" if verified else "warning",
-                        "message": {"text": text}}
-              if uri:
-                  result["locations"] = [{"physicalLocation": {
-                      "artifactLocation": {"uri": uri},
-                      "region": {"startLine": line_no}}}]
-              result["partialFingerprints"] = {"truffleHogFinding/v1":
-                  "/".join([detector, kind, uri, commit, redacted, str(line_no)])}
-              results.append(result)
-              rules.setdefault(detector, {"id": detector, "name": detector,
-                  "shortDescription": {"text": detector + " secret detected by TruffleHog"},
-                  "helpUri": "https://github.com/trufflesecurity/trufflehog"})
 
-          sarif = {"$schema": SCHEMA, "version": "2.1.0", "runs": [{
-              "tool": {"driver": {"name": "TruffleHog",
-                  "informationUri": "https://github.com/trufflesecurity/trufflehog",
-                  "version": "3.95.5", "rules": list(rules.values())}},
-              "results": results}]}
-          with open(dst, "w", encoding="utf-8") as handle:
-              json.dump(sarif, handle, indent=2)
-              handle.write("\n")
-          print("Wrote {} TruffleHog finding(s) to {}".format(len(results), dst))
+              message_parts = [
+                  f"{detector} secret detected and {'verified' if verified else 'unverified'} by TruffleHog."
+              ]
+              if redacted:
+                  message_parts.append(f"Redacted match: {redacted}")
+              if commit:
+                  message_parts.append(f"Commit: {commit}")
+              if source.get("email"):
+                  message_parts.append(f"Author: {source['email']}")
+              if decoder and decoder.upper() != "PLAIN":
+                  message_parts.append(f"Decoder: {decoder}")
+
+              result = {
+                  "ruleId": detector,
+                  "level": "error" if verified else "warning",
+                  "message": {"text": " ".join(message_parts)},
+              }
+              if uri:
+                  result["locations"] = [
+                      {
+                          "physicalLocation": {
+                              "artifactLocation": {"uri": uri},
+                              "region": {"startLine": _start_line(source)},
+                          }
+                      }
+                  ]
+              # Stable-ish fingerprint to aid de-duplication across runs.
+              fingerprint = "/".join(
+                  [detector, kind, uri, commit, redacted, str(_start_line(source))]
+              )
+              result["partialFingerprints"] = {"truffleHogFinding/v1": fingerprint}
+              return result, detector
+
+
+          def build_sarif(findings, tool_version=None):
+              results = []
+              rules = {}
+              for finding in findings:
+                  result, detector = _result(finding)
+                  results.append(result)
+                  if detector not in rules:
+                      rules[detector] = {
+                          "id": detector,
+                          "name": detector,
+                          "shortDescription": {"text": f"{detector} secret detected by TruffleHog"},
+                          "helpUri": TOOL_URI,
+                      }
+
+              driver = {
+                  "name": TOOL_NAME,
+                  "informationUri": TOOL_URI,
+                  "rules": list(rules.values()),
+              }
+              if tool_version:
+                  driver["version"] = tool_version
+
+              return {
+                  "$schema": SARIF_SCHEMA,
+                  "version": "2.1.0",
+                  "runs": [{"tool": {"driver": driver}, "results": results}],
+              }
+
+
+          def main(argv=None):
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument("input", help="TruffleHog --json (NDJSON) report path")
+              parser.add_argument("output", help="SARIF 2.1.0 output path")
+              parser.add_argument(
+                  "--tool-version", default=None, help="TruffleHog version to record in the SARIF tool driver"
+              )
+              args = parser.parse_args(argv)
+
+              findings = list(_iter_findings(args.input))
+              sarif = build_sarif(findings, tool_version=args.tool_version)
+
+              with open(args.output, "w", encoding="utf-8") as handle:
+                  json.dump(sarif, handle, indent=2)
+                  handle.write("\n")
+
+              print(f"Wrote {len(findings)} TruffleHog finding(s) to {args.output}")
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          # END GENERATED: .github/scripts/trufflehog_to_sarif.py
           PY
 
       - name: Upload TruffleHog to SecObserve
-        uses: lbnl-science-it/security-workflows/.github/actions/importer@main
+        uses: lbnl-science-it/security-workflows/.github/actions/importer@3d796045e23440d4d09a5961f37497361798db07 # published main, 2026-07-31
         with:
           so_file_name: 'trufflehog.sarif'
           so_parser_name: 'SARIF'
@@ -142,7 +290,7 @@ jobs:
       # 2. Run Trivy (local action pins secobserve-scanners image by digest)
       - name: Run Trivy Filesystem
         if: env.FULL_SCAN == 'true'
-        uses: lbnl-science-it/security-workflows/.github/actions/trivy_filesystem@main
+        uses: lbnl-science-it/security-workflows/.github/actions/trivy_filesystem@3d796045e23440d4d09a5961f37497361798db07 # published main, 2026-07-31
         with:
           target: '.'
           report_name: 'trivy.json'
@@ -153,25 +301,46 @@ jobs:
           so_origin_service: git-scan
           so_origin_docker_image_name_tag: ${{ github.sha }}
 
-      # 3. Run OSV-Scanner (pinned by image digest for total immutability)
+      # 3. Run OSV-Scanner (pinned by image digest for total immutability).
+      #    Fail closed: osv-scanner exit codes (verified against the pinned
+      #    v2.3.8 image; https://google.github.io/osv-scanner/output/):
+      #    0 = scanned, no findings; 1 = scanned, vulnerabilities found;
+      #    128 = no package sources found. All three mean the scan RAN.
+      #    Anything else (its reserved error codes, docker 125/126/127, kills
+      #    such as 137) means it did not: record the failure and upload a
+      #    sentinel finding instead of a clean empty envelope.
       - name: Generate OSV-Scanner Report
+        id: osv_scan
         if: env.FULL_SCAN == 'true'
         run: |
-          docker run --rm -v ${{ github.workspace }}:/src ${{ env.OSV_SCANNER_IMAGE }} \
+          STATUS=0
+          docker run --rm -v "$GITHUB_WORKSPACE":/src "$OSV_SCANNER_IMAGE" \
             scan \
             --format sarif \
             --recursive \
-            /src > osv_scanner.sarif || true
-          # OSV-Scanner writes nothing to stdout when no vulnerabilities are found,
-          # which leaves an empty file that SecObserve rejects. Write a minimal
-          # valid SARIF envelope so the importer can process it.
-          if [ ! -s osv_scanner.sarif ]; then
-            echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"osv-scanner","informationUri":"https://github.com/google/osv-scanner","rules":[]}},"results":[]}]}' > osv_scanner.sarif
+            /src > osv_scanner.sarif || STATUS=$?
+          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATUS" = "0" ] || [ "$STATUS" = "1" ] || [ "$STATUS" = "128" ]; then
+            # The scan ran. OSV-Scanner writes nothing to stdout when it has no
+            # findings, which leaves an empty file that SecObserve rejects.
+            # Write a minimal valid SARIF envelope so the importer can process it.
+            if [ ! -s osv_scanner.sarif ]; then
+              echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"osv-scanner","informationUri":"https://github.com/google/osv-scanner","rules":[]}},"results":[]}]}' > osv_scanner.sarif
+            fi
+          else
+            echo "scanner_failed=true" >> "$GITHUB_OUTPUT"
+            echo "::error::OSV-Scanner did not run: docker exit code $STATUS"
+            # Sentinel: keep behaviorally consistent with
+            # .github/scripts/scanner_failure_sarif.py in the git-scan repository.
+            # Both message.text and shortDescription.text carry the pinned
+            # "Scanner execution failure:" prefix (see the TruffleHog step).
+            printf '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"osv-scanner","informationUri":"https://github.com/google/osv-scanner","rules":[{"id":"scanner-execution-failure","name":"ScannerExecutionFailure","shortDescription":{"text":"Scanner execution failure: OSV-Scanner did not run"},"helpUri":"https://github.com/google/osv-scanner"}]}},"results":[{"ruleId":"scanner-execution-failure","level":"error","message":{"text":"Scanner execution failure: OSV-Scanner did not run: docker exit code %s. This is a scan-execution failure, not a finding in the scanned code: the scanner crashed or could not start, so this scan produced no results and cannot prove the target is clean."},"partialFingerprints":{"scannerExecutionFailure/v1":"OSV-Scanner"}}]}]}\n' "$STATUS" > osv_scanner.sarif
           fi
 
       - name: Upload OSV-Scanner to SecObserve
         if: env.FULL_SCAN == 'true'
-        uses: lbnl-science-it/security-workflows/.github/actions/importer@main
+        uses: lbnl-science-it/security-workflows/.github/actions/importer@3d796045e23440d4d09a5961f37497361798db07 # published main, 2026-07-31
         with:
           so_file_name: 'osv_scanner.sarif'
           so_parser_name: 'SARIF'
@@ -185,7 +354,7 @@ jobs:
       # 4. Run Semgrep (local action pins secobserve-scanners image by digest)
       - name: Run Semgrep
         if: env.FULL_SCAN == 'true'
-        uses: lbnl-science-it/security-workflows/.github/actions/semgrep@main
+        uses: lbnl-science-it/security-workflows/.github/actions/semgrep@3d796045e23440d4d09a5961f37497361798db07 # published main, 2026-07-31
         with:
           target: '.'
           configuration: 'p/default'
@@ -199,6 +368,7 @@ jobs:
           so_origin_docker_image_name_tag: ${{ github.sha }}
 
       - name: Filter Semgrep Report
+        id: filter_semgrep
         if: env.FULL_SCAN == 'true' && always()
         run: |
           if [ -f semgrep.json ]; then
@@ -228,13 +398,18 @@ jobs:
               else:
                   print('No secrets found/filtered in semgrep.json')
           except Exception as e:
-              print(f'Error filtering semgrep.json: {e}')
+              try:
+                  os.remove('semgrep.json')
+              except FileNotFoundError:
+                  pass
+              print(f'Error filtering semgrep.json: {e}', file=sys.stderr)
+              raise
             "
           fi
 
       - name: Upload Semgrep to SecObserve
-        if: env.FULL_SCAN == 'true' && always() && hashFiles('semgrep.json') != ''
-        uses: lbnl-science-it/security-workflows/.github/actions/importer@main
+        if: env.FULL_SCAN == 'true' && always() && steps.filter_semgrep.outcome == 'success' && hashFiles('semgrep.json') != ''
+        uses: lbnl-science-it/security-workflows/.github/actions/importer@3d796045e23440d4d09a5961f37497361798db07 # published main, 2026-07-31
         with:
           so_file_name: 'semgrep.json'
           so_parser_name: 'SARIF'
@@ -248,21 +423,52 @@ jobs:
       # 5. Check SecObserve security gate (local action pins secobserve-scanners image by digest)
       - name: Check Security Gate
         if: env.FULL_SCAN == 'true'
-        uses: lbnl-science-it/security-workflows/.github/actions/check_security_gate@main
+        uses: lbnl-science-it/security-workflows/.github/actions/check_security_gate@3d796045e23440d4d09a5961f37497361798db07 # published main, 2026-07-31
         with:
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
           so_product_name: ${{ github.event.repository.name }}
 
-      # 6. Upload Artifacts (filenames contain the commit SHA for traceability)
+      # 6. Upload Artifacts (filenames contain the commit SHA for traceability).
+      #    trufflehog.json is deliberately NOT here: the raw NDJSON carries each
+      #    verified secret in plaintext (Raw/RawV2), so it stays on the runner's
+      #    disk as the converter's input only. The SARIF is the redacted form.
       - name: Upload Artifacts
-        uses: actions/upload-artifact@v6
+        if: always() && steps.filter_semgrep.outcome != 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: security-reports-${{ github.sha }}
           if-no-files-found: ignore
           path: |
-            trufflehog.json
             trufflehog.sarif
             trivy.json
             osv_scanner.sarif
             semgrep.json
+
+      # 7. Fail the job if any scanner did not run. Each failure was recorded
+      #    when it happened and a scanner-execution-failure sentinel was
+      #    uploaded to SecObserve in the scan's place, so the other scanners
+      #    still ran and the data says why this run is red. (A step skipped by
+      #    FULL_SCAN leaves its outputs empty and is not a failure.)
+      - name: Enforce scanner status
+        if: always()
+        env:
+          TRUFFLEHOG_FAILED: ${{ steps.trufflehog_scan.outputs.scanner_failed }}
+          TRUFFLEHOG_EXIT_CODE: ${{ steps.trufflehog_scan.outputs.exit_code }}
+          OSV_FAILED: ${{ steps.osv_scan.outputs.scanner_failed }}
+          OSV_EXIT_CODE: ${{ steps.osv_scan.outputs.exit_code }}
+        run: |
+          FAILED=0
+          if [ "$TRUFFLEHOG_FAILED" = "true" ]; then
+            echo "::error::TruffleHog did not run (docker exit code $TRUFFLEHOG_EXIT_CODE); a sentinel finding was uploaded in its place"
+            FAILED=1
+          fi
+          if [ "$OSV_FAILED" = "true" ]; then
+            echo "::error::OSV-Scanner did not run (docker exit code $OSV_EXIT_CODE); a sentinel finding was uploaded in its place"
+            FAILED=1
+          fi
+          if [ "$FAILED" -ne 0 ]; then
+            echo "A scanner that did not run is not a clean scan; failing the job."
+            exit 1
+          fi
+          echo "All scanners ran."
