@@ -37,7 +37,7 @@ on:
 # repository closes its stale rows, and every scan after that updates in place.
 # See docs/scanning.md, "How a finding disappears".
 env:
-  WORKFLOW_VERSION: "1.17.0"
+  WORKFLOW_VERSION: "1.18.0"
   # Pin Docker images by digest for reproducibility (avoid floating monthly tags).
   # secobserve-scanners:2026_04 amd64 digest (also carries gitleaks and trivy config):
   SO_SCANNERS_IMAGE: 'ghcr.io/secobserve/secobserve-scanners@sha256:c142c4bac337fefebc991b5b9b43b26b371ed44672c0f5291f819faa1902f9e7'
@@ -143,7 +143,24 @@ jobs:
         id: trufflehog_scan
         run: |
           STATUS=0
-          docker run --rm -v "$GITHUB_WORKSPACE":/repo "$TRUFFLEHOG_IMAGE" \
+          # --network host is what makes this scanner work at all here, and it is
+          # not a preference. `--results=verified` reports only credentials it can
+          # authenticate, which means an outbound call per candidate. On the
+          # default bridge network of this runner's dind daemon those calls go
+          # nowhere — measured 2026-08-15 against the standing fixture, same
+          # command and same repository: bridge `"verified_secrets":0`, host
+          # network `"verified_secrets":1`. So every GitHub-Actions scan in the
+          # estate reported zero secrets whatever the repository contained, and a
+          # scan that *cannot* find secrets is indistinguishable from a clean one
+          # unless you read `verification_caching.Misses`, which counts detectors
+          # that fired and were never checked.
+          #
+          # In this dind setup `--network host` is the *Pod's* namespace, which
+          # the runner container shares and which does have egress. It widens
+          # nothing that matters: the Pod already runs a privileged docker:dind
+          # sidecar with the socket mounted, so a scanner container is not what
+          # bounds this Pod.
+          docker run --rm --network host -v "$GITHUB_WORKSPACE":/repo "$TRUFFLEHOG_IMAGE" \
             git file:///repo --results=verified --json --no-update > trufflehog.json || STATUS=$?
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
           if [ "$STATUS" -ne 0 ]; then
