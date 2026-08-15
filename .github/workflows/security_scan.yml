@@ -37,7 +37,7 @@ on:
 # repository closes its stale rows, and every scan after that updates in place.
 # See docs/scanning.md, "How a finding disappears".
 env:
-  WORKFLOW_VERSION: "1.15.0"
+  WORKFLOW_VERSION: "1.16.0"
   # Pin Docker images by digest for reproducibility (avoid floating monthly tags).
   # secobserve-scanners:2026_04 amd64 digest:
   SO_SCANNERS_IMAGE: 'ghcr.io/secobserve/secobserve-scanners@sha256:c142c4bac337fefebc991b5b9b43b26b371ed44672c0f5291f819faa1902f9e7'
@@ -331,8 +331,11 @@ jobs:
             scan \
             --format sarif \
             --recursive \
-            /src > osv_scanner.sarif || STATUS=$?
+            /src > osv_scanner.sarif 2> osv_scanner.stderr || STATUS=$?
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          # Keep the scanner's own diagnostics in the job log; the redirect above
+          # is only so the extraction check below can read them.
+          cat osv_scanner.stderr
 
           if [ "$STATUS" = "0" ] || [ "$STATUS" = "1" ] || [ "$STATUS" = "128" ]; then
             # The scan ran. OSV-Scanner writes nothing to stdout when it has no
@@ -340,6 +343,67 @@ jobs:
             # Write a minimal valid SARIF envelope so the importer can process it.
             if [ ! -s osv_scanner.sarif ]; then
               echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"osv-scanner","informationUri":"https://github.com/google/osv-scanner","rules":[]}},"results":[]}]}' > osv_scanner.sarif
+            fi
+            # A manifest OSV-Scanner cannot parse is invisible to the exit code:
+            # it prints "Error during extraction" and still exits successfully,
+            # so a repository whose manifests do not parse gets a clean SCA
+            # verdict on a green run. Append a sentinel BESIDE the real findings
+            # rather than replacing them — the rest of the scan is valid — and
+            # leave the run green on purpose: this is measuring how often it
+            # happens before it is allowed to fail anything.
+            # Keep behaviorally consistent with security_scan.yml and
+            # adhoc_scan.yml.
+            python3 - osv_scanner.sarif osv_scanner.stderr <<'EXTRACTION'
+          import json, sys
+
+          sarif_path, stderr_path = sys.argv[1], sys.argv[2]
+          lines = [line.strip() for line in open(stderr_path, errors='replace')
+                   if 'Error during extraction' in line]
+          if not lines:
+              raise SystemExit(0)
+
+          with open(sarif_path) as handle:
+              sarif = json.load(handle)
+
+          detail = ' | '.join(lines[:5])
+          if len(lines) > 5:
+              detail += ' | and %d more' % (len(lines) - 5)
+
+          # The "Scanner execution failure:" prefix is what SecObserve titles the
+          # observation from and what AppSec Insights matches on. This is a
+          # partial-coverage failure rather than a crash, and the title says so.
+          rule = {
+              'id': 'scanner-extraction-failure',
+              'name': 'Scanner execution failure: OSV-Scanner could not read every manifest',
+              'shortDescription': {'text': 'Scanner execution failure: OSV-Scanner could not read every manifest'},
+              'helpUri': 'https://github.com/google/osv-scanner',
+          }
+          result = {
+              'ruleId': 'scanner-extraction-failure',
+              'level': 'error',
+              'message': {'text':
+                  'Scanner execution failure: OSV-Scanner could not read every manifest, so this '
+                  'scan does not cover the whole dependency tree and cannot prove the target is '
+                  'clean. OSV-Scanner reports these on stderr and exits successfully, which is why '
+                  'the run is green. %d extraction error(s): %s' % (len(lines), detail)},
+              'partialFingerprints': {'scannerExecutionFailure/v1': 'OSV-Scanner-extraction'},
+          }
+
+          runs = sarif.setdefault('runs', [])
+          if not runs:
+              runs.append({'tool': {'driver': {'name': 'osv-scanner',
+                                               'informationUri': 'https://github.com/google/osv-scanner',
+                                               'rules': []}},
+                           'results': []})
+          runs[0].setdefault('tool', {}).setdefault('driver', {}).setdefault('rules', []).append(rule)
+          runs[0].setdefault('results', []).append(result)
+
+          with open(sarif_path, 'w') as handle:
+              json.dump(sarif, handle)
+          print('Appended an extraction-failure sentinel (%d error(s)) to %s' % (len(lines), sarif_path))
+          EXTRACTION
+            if grep -q 'Error during extraction' osv_scanner.stderr; then
+              echo "::warning::OSV-Scanner could not read every manifest; a sentinel was uploaded beside the results. The run stays green."
             fi
           else
             echo "scanner_failed=true" >> "$GITHUB_OUTPUT"
