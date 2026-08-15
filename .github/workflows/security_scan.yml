@@ -21,8 +21,23 @@ on:
         description: 'SecObserve API token used to upload observations'
         required: true
 
+# `so_origin_docker_image_name_tag` is deliberately not set on any importer call
+# below. It used to carry `${{ github.sha }}`, and that is what an observation's
+# identity is built from, so every commit minted a new identity for the same
+# finding: the importer resolved the row a reviewer had assessed and inserted an
+# identical `Open` one beside it. A `False positive` dismissal therefore survived
+# only until the next push, and each commit left a full generation of rows behind
+# (measured 2026-08-14: 225 rows for 45 findings over five scans).
+#
+# The field means *container image tag*. Nothing in this repository reads it, the
+# importer action declares it `required: false`, and the commit SHA is already in
+# the artifact filenames where traceability actually wants it. Resolution scope
+# does not include it either — a scan whose SHA differed still resolved the
+# previous generation — so removing it is self-healing: the next scan of each
+# repository closes its stale rows, and every scan after that updates in place.
+# See docs/scanning.md, "How a finding disappears".
 env:
-  WORKFLOW_VERSION: "1.13.0"
+  WORKFLOW_VERSION: "1.15.0"
   # Pin Docker images by digest for reproducibility (avoid floating monthly tags).
   # secobserve-scanners:2026_04 amd64 digest:
   SO_SCANNERS_IMAGE: 'ghcr.io/secobserve/secobserve-scanners@sha256:c142c4bac337fefebc991b5b9b43b26b371ed44672c0f5291f819faa1902f9e7'
@@ -65,7 +80,7 @@ jobs:
         run: |
           STATUS=0
           docker run --rm -v "$GITHUB_WORKSPACE":/repo "$TRUFFLEHOG_IMAGE" \
-            git file:///repo --results=verified --json > trufflehog.json || STATUS=$?
+            git file:///repo --results=verified --json --no-update > trufflehog.json || STATUS=$?
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
           if [ "$STATUS" -ne 0 ]; then
             echo "scanner_failed=true" >> "$GITHUB_OUTPUT"
@@ -86,7 +101,7 @@ jobs:
           # observation title starts with it whichever field SecObserve titles
           # from; Insights matches the failure by that title prefix.
           if [ "$TRUFFLEHOG_EXIT_CODE" != "0" ]; then
-            printf '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"TruffleHog","informationUri":"https://github.com/trufflesecurity/trufflehog","version":"3.95.5","rules":[{"id":"scanner-execution-failure","name":"ScannerExecutionFailure","shortDescription":{"text":"Scanner execution failure: TruffleHog did not run"},"helpUri":"https://github.com/trufflesecurity/trufflehog"}]}},"results":[{"ruleId":"scanner-execution-failure","level":"error","message":{"text":"Scanner execution failure: TruffleHog did not run: docker exit code %s. This is a scan-execution failure, not a finding in the scanned code: the scanner crashed or could not start, so this scan produced no results and cannot prove the target is clean."},"partialFingerprints":{"scannerExecutionFailure/v1":"TruffleHog"}}]}]}\n' "$TRUFFLEHOG_EXIT_CODE" > trufflehog.sarif
+            printf '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"TruffleHog","informationUri":"https://github.com/trufflesecurity/trufflehog","version":"3.95.5","rules":[{"id":"scanner-execution-failure","name":"Scanner execution failure: TruffleHog did not run","shortDescription":{"text":"Scanner execution failure: TruffleHog did not run"},"helpUri":"https://github.com/trufflesecurity/trufflehog"}]}},"results":[{"ruleId":"scanner-execution-failure","level":"error","message":{"text":"Scanner execution failure: TruffleHog did not run: docker exit code %s. This is a scan-execution failure, not a finding in the scanned code: the scanner crashed or could not start, so this scan produced no results and cannot prove the target is clean."},"partialFingerprints":{"scannerExecutionFailure/v1":"TruffleHog"}}]}]}\n' "$TRUFFLEHOG_EXIT_CODE" > trufflehog.sarif
             echo "Wrote scanner-execution-failure sentinel to trufflehog.sarif"
             exit 0
           fi
@@ -285,7 +300,6 @@ jobs:
           so_product_name: ${{ github.event.repository.name }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
-          so_origin_docker_image_name_tag: ${{ github.sha }}
 
       # 2. Run Trivy (local action pins secobserve-scanners image by digest)
       - name: Run Trivy Filesystem
@@ -299,7 +313,6 @@ jobs:
           so_product_name: ${{ github.event.repository.name }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
-          so_origin_docker_image_name_tag: ${{ github.sha }}
 
       # 3. Run OSV-Scanner (pinned by image digest for total immutability).
       #    Fail closed: osv-scanner exit codes (verified against the pinned
@@ -335,7 +348,7 @@ jobs:
             # .github/scripts/scanner_failure_sarif.py in the git-scan repository.
             # Both message.text and shortDescription.text carry the pinned
             # "Scanner execution failure:" prefix (see the TruffleHog step).
-            printf '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"osv-scanner","informationUri":"https://github.com/google/osv-scanner","rules":[{"id":"scanner-execution-failure","name":"ScannerExecutionFailure","shortDescription":{"text":"Scanner execution failure: OSV-Scanner did not run"},"helpUri":"https://github.com/google/osv-scanner"}]}},"results":[{"ruleId":"scanner-execution-failure","level":"error","message":{"text":"Scanner execution failure: OSV-Scanner did not run: docker exit code %s. This is a scan-execution failure, not a finding in the scanned code: the scanner crashed or could not start, so this scan produced no results and cannot prove the target is clean."},"partialFingerprints":{"scannerExecutionFailure/v1":"OSV-Scanner"}}]}]}\n' "$STATUS" > osv_scanner.sarif
+            printf '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"osv-scanner","informationUri":"https://github.com/google/osv-scanner","rules":[{"id":"scanner-execution-failure","name":"Scanner execution failure: OSV-Scanner did not run","shortDescription":{"text":"Scanner execution failure: OSV-Scanner did not run"},"helpUri":"https://github.com/google/osv-scanner"}]}},"results":[{"ruleId":"scanner-execution-failure","level":"error","message":{"text":"Scanner execution failure: OSV-Scanner did not run: docker exit code %s. This is a scan-execution failure, not a finding in the scanned code: the scanner crashed or could not start, so this scan produced no results and cannot prove the target is clean."},"partialFingerprints":{"scannerExecutionFailure/v1":"OSV-Scanner"}}]}]}\n' "$STATUS" > osv_scanner.sarif
           fi
 
       - name: Upload OSV-Scanner to SecObserve
@@ -349,7 +362,6 @@ jobs:
           so_product_name: ${{ github.event.repository.name }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
-          so_origin_docker_image_name_tag: ${{ github.sha }}
 
       # 4. Run Semgrep (local action pins secobserve-scanners image by digest)
       - name: Run Semgrep
@@ -365,7 +377,6 @@ jobs:
           so_product_name: ${{ github.event.repository.name }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
-          so_origin_docker_image_name_tag: ${{ github.sha }}
 
       # Semgrep's p/default pack includes the `generic.secrets.*` rules, whose
       # whole job is matching credential *values* — and SecObserve stores the
@@ -449,7 +460,6 @@ jobs:
           so_product_name: ${{ github.event.repository.name }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
-          so_origin_docker_image_name_tag: ${{ github.sha }}
 
       # 5. Check SecObserve security gate (local action pins secobserve-scanners image by digest)
       - name: Check Security Gate
