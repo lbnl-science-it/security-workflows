@@ -1,6 +1,6 @@
 # Vendored from SecObserve/secobserve_actions_templates/actions/importer
 # at commit ba98519d49c0e6c320305beb0e128d70d4d098d1, with the Docker image
-# pinned by digest instead of the floating :2026_04 monthly tag.
+# pinned by digest instead of the floating :2026_07 monthly tag.
 name: 'SecObserve Importer'
 description: 'Import results of vulnerability scanner into SecObserve'
 author: 'SecObserve'
@@ -44,7 +44,7 @@ inputs:
 
 runs:
   using: 'docker'
-  image: 'docker://ghcr.io/secobserve/secobserve-scanners@sha256:c142c4bac337fefebc991b5b9b43b26b371ed44672c0f5291f819faa1902f9e7'
+  image: 'docker://ghcr.io/secobserve/secobserve-scanners@sha256:d1f28acb381dd7e5664f588d5c7343df06aa51020f850ba3b907504e9d23769e'
   entrypoint: 'file_upload_observations.sh'
   env:
     SO_UPLOAD: ${{ inputs.so_upload }}

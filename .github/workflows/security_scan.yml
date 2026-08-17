@@ -37,14 +37,29 @@ on:
 # repository closes its stale rows, and every scan after that updates in place.
 # See docs/scanning.md, "How a finding disappears".
 env:
-  WORKFLOW_VERSION: "1.18.0"
+  WORKFLOW_VERSION: "1.19.0"
   # Pin Docker images by digest for reproducibility (avoid floating monthly tags).
-  # secobserve-scanners:2026_04 amd64 digest (also carries gitleaks and trivy config):
-  SO_SCANNERS_IMAGE: 'ghcr.io/secobserve/secobserve-scanners@sha256:c142c4bac337fefebc991b5b9b43b26b371ed44672c0f5291f819faa1902f9e7'
-  # osv-scanner v2.3.8 amd64 digest:
+  # secobserve-scanners:2026_07 amd64 digest (also carries gitleaks and trivy config).
+  # It bundles gitleaks 8.30.1 (unchanged from 2026_04), trivy 0.72.0 and semgrep
+  # 1.170.0 -- so a bump here moves three scanners at once, and the versions are
+  # named because nothing else in this file records them. 2026_05 was never
+  # published and 2026_06 is deliberately skipped: it pairs Alpine 3.24.0 (musl
+  # 1.2.6) with semgrep 1.166.0, and semgrep 1.170.0 is the release that fixes
+  # `Fatal error: Failed to allocate signal stack for domain 0` on musl 1.2.6.
+  # 2026_04 was safe from that only because it is still Alpine 3.23.4:
+  SO_SCANNERS_IMAGE: 'ghcr.io/secobserve/secobserve-scanners@sha256:d1f28acb381dd7e5664f588d5c7343df06aa51020f850ba3b907504e9d23769e'
+  # osv-scanner v2.3.8 amd64 digest. Deliberately NOT moved with the others: 2.5.0
+  # migrated scanning, filtering and matching onto the osv-scalibr pipeline, and
+  # both this repository's OSV contracts are observations of the old one -- the
+  # exit-code set 0/1/128 below, and the `Error during extraction` stderr string
+  # the partial-coverage sentinel greps for. Bumping needs those re-verified:
   OSV_SCANNER_IMAGE: 'ghcr.io/google/osv-scanner@sha256:904f48030672996473eda96b9193a090c0b2096b0d45b63e51b19b34533b7171'
-  # trufflehog v3.95.5 multi-arch digest (official image; the secobserve-scanners image has no trufflehog binary):
-  TRUFFLEHOG_IMAGE: 'ghcr.io/trufflesecurity/trufflehog@sha256:56c25710275c4b8d74c4f1346a5e7c606fa7ff4afe996f680b288d0fae3fcd9c'
+  # trufflehog 3.97.0 multi-arch digest (official image; the secobserve-scanners
+  # image has no trufflehog binary). The tag carries no `v` prefix -- `:v3.97.0`
+  # does not exist. 3.95.6 is why this moved: a line longer than bufio's 64 KB
+  # token limit was skipped outright, so a secret on one long line (minified JS, a
+  # single-line .env) was never scanned:
+  TRUFFLEHOG_IMAGE: 'ghcr.io/trufflesecurity/trufflehog@sha256:ff4c95e9df7d645daf2140e3ca1039031c63106268d5fbb25feb43ceca1bcc33'
   # zizmor 1.29.0 multi-arch digest. The tag carries no `v` prefix -- `:v1.29.0`
   # does not exist -- so the digest is the only safe reference anyway:
   ZIZMOR_IMAGE: 'ghcr.io/zizmorcore/zizmor@sha256:863026d54f91271b10b60b67ad8054cb37120167e162482597db102b3026a284'
@@ -186,16 +201,34 @@ jobs:
             echo "Wrote scanner-execution-failure sentinel to trufflehog.sarif"
             exit 0
           fi
-          python3 - trufflehog.json trufflehog.sarif --tool-version 3.95.5 <<'PY'
+          python3 - trufflehog.json trufflehog.sarif --tool-version 3.97.0 <<'PY'
           # BEGIN GENERATED: .github/scripts/trufflehog_to_sarif.py
           #!/usr/bin/env python3
           """Convert TruffleHog JSON output into SARIF 2.1.0 for SecObserve.
 
-          SecObserve has no TruffleHog parser, but it does have a SARIF parser. TruffleHog
-          cannot emit SARIF natively (only default / --json / --github-actions), so this
-          script bridges the gap: it reads TruffleHog's newline-delimited JSON (one finding
-          per line, as produced by `trufflehog ... --json`) and writes a SARIF report that
+          SecObserve has no TruffleHog parser, but it does have a SARIF parser. This script
+          bridges the gap: it reads TruffleHog's newline-delimited JSON (one finding per
+          line, as produced by `trufflehog ... --json`) and writes a SARIF report that
           SecObserve's SARIF parser accepts.
+
+          TruffleHog gained a native `--sarif` output in 3.97.0, and we deliberately do not
+          use it. Two reasons, both about what SecObserve does with the document rather than
+          about the document being wrong:
+
+            - Its tool driver name is lowercase `trufflehog`. SecObserve takes the scanner
+              identifier straight from the SARIF driver name, and `VERIFIED_SECRET_SCANNERS`
+              in `apps/insights-api/src/read-model.ts` is `['TruffleHog']` — so switching
+              would drop every verified secret out of the verified partition, zero
+              `secrets_verified`, and stop the `urgent` tier firing, with no error anywhere.
+              That failure has happened once already, over gitleaks' casing.
+            - Its message is `"Found verified result for detector X."` and carries no
+              redacted match, commit or author. Ours carries all three, which is the triage
+              detail a reviewer opens the finding for — and changing the message re-identifies
+              every existing observation, splitting assessed rows from new Open ones.
+
+          Upstream is clean on the axis that matters most: it emits no raw secret either,
+          only a SHA-256 of it in the fingerprint. Adopting it is a decision about scanner
+          identity and observation identity, not a drop-in — see docs/scanning.md.
 
           Severity mapping (SecObserve SARIF parser): SARIF `level` "error" -> HIGH,
           "warning" -> MEDIUM. We run TruffleHog with --results=verified, so every finding
