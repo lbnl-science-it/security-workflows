@@ -37,7 +37,7 @@ on:
 # repository closes its stale rows, and every scan after that updates in place.
 # See docs/scanning.md, "How a finding disappears".
 env:
-  WORKFLOW_VERSION: "1.20.0"
+  WORKFLOW_VERSION: "1.21.0"
   # Pin Docker images by digest for reproducibility (avoid floating monthly tags).
   # secobserve-scanners:2026_07 amd64 digest (also carries gitleaks and trivy config).
   # It bundles gitleaks 8.30.1 (unchanged from 2026_04), trivy 0.72.0 and semgrep
@@ -197,7 +197,7 @@ jobs:
           # observation title starts with it whichever field SecObserve titles
           # from; Insights matches the failure by that title prefix.
           if [ "$TRUFFLEHOG_EXIT_CODE" != "0" ]; then
-            printf '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"TruffleHog","informationUri":"https://github.com/trufflesecurity/trufflehog","version":"3.95.5","rules":[{"id":"scanner-execution-failure","name":"Scanner execution failure: TruffleHog did not run","shortDescription":{"text":"Scanner execution failure: TruffleHog did not run"},"helpUri":"https://github.com/trufflesecurity/trufflehog"}]}},"results":[{"ruleId":"scanner-execution-failure","level":"error","message":{"text":"Scanner execution failure: TruffleHog did not run: docker exit code %s. This is a scan-execution failure, not a finding in the scanned code: the scanner crashed or could not start, so this scan produced no results and cannot prove the target is clean."},"partialFingerprints":{"scannerExecutionFailure/v1":"TruffleHog"}}]}]}\n' "$TRUFFLEHOG_EXIT_CODE" > trufflehog.sarif
+            printf '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"TruffleHog","informationUri":"https://github.com/trufflesecurity/trufflehog","version":"3.97.0","rules":[{"id":"scanner-execution-failure","name":"Scanner execution failure: TruffleHog did not run","shortDescription":{"text":"Scanner execution failure: TruffleHog did not run"},"helpUri":"https://github.com/trufflesecurity/trufflehog"}]}},"results":[{"ruleId":"scanner-execution-failure","level":"error","message":{"text":"Scanner execution failure: TruffleHog did not run: docker exit code %s. This is a scan-execution failure, not a finding in the scanned code: the scanner crashed or could not start, so this scan produced no results and cannot prove the target is clean."},"partialFingerprints":{"scannerExecutionFailure/v1":"TruffleHog"}}]}]}\n' "$TRUFFLEHOG_EXIT_CODE" > trufflehog.sarif
             echo "Wrote scanner-execution-failure sentinel to trufflehog.sarif"
             exit 0
           fi
