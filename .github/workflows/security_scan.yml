@@ -37,7 +37,29 @@ on:
 # repository closes its stale rows, and every scan after that updates in place.
 # See docs/scanning.md, "How a finding disappears".
 env:
-  WORKFLOW_VERSION: "1.22.0"
+  # 1.23.0 — so_product_name is the repository URL (host and path) rather than
+  # the repository name. A name is not unique across an estate spanning two
+  # forges and many namespaces: 23 of 178 repositories shared one, so two
+  # repositories uploaded into a single SecObserve product.
+  WORKFLOW_VERSION: "1.23.0"
+  # Which repository this run is scanning, as the two halves of its URL.
+  #
+  # The GitLab template declares the SAME TWO NAMES and composes them the same
+  # way, each mapping from its own platform's variables on one line, so a reader
+  # comparing the two files sees one rule rather than two expressions that happen
+  # to agree today. `scripts/product-name-templates.test.ts` fails if they stop
+  # agreeing.
+  #
+  # The host is written out because `github.server_url` is `https://github.com`
+  # and workflow expressions have no `replace()` to strip the scheme. A GitHub
+  # Enterprise deployment changes this one line, which is now named for what it
+  # is. `github.repository` is already `owner/repo`.
+  #
+  # ⚠️ These are composed at each USE SITE, not here. Workflow-level `env` may
+  # read the `github`, `vars` and `inputs` contexts but NOT `env` itself, so a
+  # third entry combining these two would silently fail to resolve.
+  APPSEC_FORGE_HOST: github.com
+  APPSEC_REPO_PATH: ${{ github.repository }}
   # Pin Docker images by digest for reproducibility (avoid floating monthly tags).
   # secobserve-scanners:2026_07 amd64 digest (also carries gitleaks and trivy config).
   # It bundles gitleaks 8.30.1 (unchanged from 2026_04), trivy 0.72.0 and semgrep
@@ -154,7 +176,7 @@ jobs:
           so_parser_name: 'SARIF'
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
-          so_product_name: ${{ github.event.repository.name }}
+          so_product_name: ${{ env.APPSEC_FORGE_HOST }}/${{ env.APPSEC_REPO_PATH }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
 
@@ -433,7 +455,7 @@ jobs:
           so_parser_name: 'SARIF'
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
-          so_product_name: ${{ github.event.repository.name }}
+          so_product_name: ${{ env.APPSEC_FORGE_HOST }}/${{ env.APPSEC_REPO_PATH }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
 
@@ -446,7 +468,7 @@ jobs:
           report_name: 'trivy.json'
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
-          so_product_name: ${{ github.event.repository.name }}
+          so_product_name: ${{ env.APPSEC_FORGE_HOST }}/${{ env.APPSEC_REPO_PATH }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
 
@@ -494,7 +516,7 @@ jobs:
           so_parser_name: 'SARIF'
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
-          so_product_name: ${{ github.event.repository.name }}
+          so_product_name: ${{ env.APPSEC_FORGE_HOST }}/${{ env.APPSEC_REPO_PATH }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
 
@@ -611,7 +633,7 @@ jobs:
           so_parser_name: 'SARIF'
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
-          so_product_name: ${{ github.event.repository.name }}
+          so_product_name: ${{ env.APPSEC_FORGE_HOST }}/${{ env.APPSEC_REPO_PATH }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
 
@@ -637,7 +659,7 @@ jobs:
           so_upload: 'false'
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
-          so_product_name: ${{ github.event.repository.name }}
+          so_product_name: ${{ env.APPSEC_FORGE_HOST }}/${{ env.APPSEC_REPO_PATH }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
 
@@ -720,7 +742,7 @@ jobs:
           so_parser_name: 'SARIF'
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
-          so_product_name: ${{ github.event.repository.name }}
+          so_product_name: ${{ env.APPSEC_FORGE_HOST }}/${{ env.APPSEC_REPO_PATH }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
 
@@ -793,7 +815,7 @@ jobs:
           so_parser_name: 'SARIF'
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
-          so_product_name: ${{ github.event.repository.name }}
+          so_product_name: ${{ env.APPSEC_FORGE_HOST }}/${{ env.APPSEC_REPO_PATH }}
           so_branch_name: ${{ github.ref_name }}
           so_origin_service: git-scan
 
@@ -804,7 +826,7 @@ jobs:
         with:
           so_api_base_url: ${{ vars.SO_API_BASE_URL }}
           so_api_token: ${{ secrets.SO_API_TOKEN }}
-          so_product_name: ${{ github.event.repository.name }}
+          so_product_name: ${{ env.APPSEC_FORGE_HOST }}/${{ env.APPSEC_REPO_PATH }}
 
       # 9. Upload Artifacts (filenames contain the commit SHA for traceability).
       #    trufflehog.json is deliberately NOT here: the raw NDJSON carries each
